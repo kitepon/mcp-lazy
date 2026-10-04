@@ -5,7 +5,9 @@ initialization and listings let unused servers stay asleep. Once started, the
 server stays alive by default, preserving its in-memory session state.
 
 Version 0.3.0 is a Linux trial build. Real-client acceptance for this version is
-pending. The public name and license have not been selected yet.
+pending. A license has not been selected yet.
+
+Source: https://github.com/kitepon/mcp-lazy
 
 ## Build and run
 
