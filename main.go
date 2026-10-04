@@ -30,7 +30,7 @@ import (
 	"time"
 )
 
-const version = "0.1.0"
+const version = "0.2.0"
 
 // cacheSchema changes whenever the cache file layout changes.
 const cacheSchema = 1
@@ -69,10 +69,14 @@ type cacheFile struct {
 }
 
 type relay struct {
-	command   []string
-	cachePath string
-	idleStop  time.Duration
-	log       func(string, ...any)
+	command      []string
+	cachePath    string
+	idleStop     time.Duration
+	startTimeout time.Duration
+	startTimer   *time.Timer
+	startTick    <-chan time.Time
+	discardChild bool
+	log          func(string, ...any)
 
 	out   *bufio.Writer
 	outMu sync.Mutex
@@ -85,14 +89,18 @@ type relay struct {
 	initialized bool
 
 	// Server process.
-	cmd      *exec.Cmd
-	childIn  io.WriteCloser
-	running  bool
-	starting bool
-	queue    [][]byte // client lines waiting for the server's handshake
-	spawns   int
-	initID   string
-	checkIDs map[string]string // internal request id -> listing method being verified
+	cmd         *exec.Cmd
+	childIn     io.WriteCloser
+	childWrites chan []byte
+	writeErrors chan error
+	writeStop   chan struct{}
+	stopping    bool
+	running     bool
+	starting    bool
+	queue       [][]byte // client lines waiting for the server's handshake
+	spawns      int
+	initID      string
+	checkIDs    map[string]string // internal request id -> listing method being verified
 
 	inflight       map[string]string // client request id -> method, awaiting the server
 	early          map[string]bool   // client request ids sent before initialize
@@ -112,6 +120,8 @@ func main() {
 	}
 	cacheDir := fs.String("cache-dir", "", "directory for the recorded handshake (default: the user cache directory)")
 	idleStop := fs.Duration("idle-stop", 0, "stop the server after this long without traffic; 0 keeps it running once started")
+	startTimeout := fs.Duration("start-timeout", 60*time.Second, "maximum time for startup, initialization and internal list refresh; must be positive")
+	check := fs.Bool("check", false, "initialize the server, record its listings and exit (JSON report on stdout)")
 	showVersion := fs.Bool("version", false, "print the version and exit")
 	verbose := fs.Bool("verbose", false, "log what mcp-lazy does to stderr")
 	logFile := fs.String("log-file", "", "append what mcp-lazy does to this file")
@@ -121,6 +131,25 @@ func main() {
 	if *showVersion {
 		fmt.Println("mcp-lazy", version)
 		return
+	}
+	// An explicit CLI flag wins, even when the corresponding environment value is invalid.
+	explicit := map[string]bool{}
+	fs.Visit(func(f *flag.Flag) { explicit[f.Name] = true })
+	for name, variable := range map[string]string{
+		"cache-dir": "MCP_LAZY_CACHE_DIR", "idle-stop": "MCP_LAZY_IDLE_STOP",
+		"start-timeout": "MCP_LAZY_START_TIMEOUT", "log-file": "MCP_LAZY_LOG_FILE",
+		"verbose": "MCP_LAZY_VERBOSE",
+	} {
+		if value, ok := os.LookupEnv(variable); ok && !explicit[name] {
+			if err := fs.Set(name, value); err != nil {
+				fmt.Fprintf(os.Stderr, "mcp-lazy: invalid %s: %v\n", variable, err)
+				os.Exit(2)
+			}
+		}
+	}
+	if *startTimeout <= 0 || *idleStop < 0 {
+		fmt.Fprintln(os.Stderr, "mcp-lazy: start-timeout must be positive and idle-stop must not be negative")
+		os.Exit(2)
 	}
 	command := fs.Args()
 	if len(command) == 0 {
@@ -139,6 +168,7 @@ func main() {
 		command:        command,
 		cachePath:      filepath.Join(dir, cacheKey(command)+".json"),
 		idleStop:       *idleStop,
+		startTimeout:   *startTimeout,
 		out:            bufio.NewWriter(os.Stdout),
 		inflight:       map[string]string{},
 		early:          map[string]bool{},
@@ -165,6 +195,14 @@ func main() {
 		}
 	}
 	r.cache = loadCache(r.cachePath, command)
+	if *check {
+		r.out = bufio.NewWriter(io.Discard)
+		if err := r.runCheck(); err != nil {
+			fmt.Fprintln(os.Stderr, "mcp-lazy: check failed:", err)
+			os.Exit(1)
+		}
+		return
+	}
 	os.Exit(r.run(os.Stdin))
 }
 
@@ -220,27 +258,37 @@ func sameJSON(a, b json.RawMessage) bool {
 	return reflect.DeepEqual(x, y)
 }
 
-func (r *relay) saveCache() {
+func (r *relay) saveCache() error {
 	var buffer bytes.Buffer
 	encoder := json.NewEncoder(&buffer)
 	encoder.SetEscapeHTML(false)
-	if encoder.Encode(r.cache) != nil {
-		return
+	if err := encoder.Encode(r.cache); err != nil {
+		return err
 	}
 	data := buffer.Bytes()
 	dir := filepath.Dir(r.cachePath)
-	if os.MkdirAll(dir, 0o700) != nil {
-		return
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		return err
 	}
 	tmp, err := os.CreateTemp(dir, ".tmp-*")
 	if err != nil {
-		return
+		return err
 	}
 	_, werr := tmp.Write(data)
 	cerr := tmp.Close()
-	if werr != nil || cerr != nil || os.Rename(tmp.Name(), r.cachePath) != nil {
+	if werr != nil {
 		os.Remove(tmp.Name())
+		return werr
 	}
+	if cerr != nil {
+		os.Remove(tmp.Name())
+		return cerr
+	}
+	if err := os.Rename(tmp.Name(), r.cachePath); err != nil {
+		os.Remove(tmp.Name())
+		return err
+	}
+	return nil
 }
 
 func (r *relay) entry() *entry {
@@ -272,6 +320,8 @@ func (r *relay) run(stdin io.Reader) int {
 	}()
 	signals := make(chan os.Signal, 1)
 	signal.Notify(signals, syscall.SIGTERM, syscall.SIGINT)
+	defer signal.Stop(signals)
+	defer r.endStartup()
 
 	var idle <-chan time.Time
 	var idleTimer *time.Timer
@@ -302,6 +352,19 @@ func (r *relay) run(stdin io.Reader) int {
 		case err := <-r.childDone:
 			r.drainChild()
 			r.childExited(err)
+		case err := <-r.writeErrors:
+			r.log("server input failed: %v", err)
+			r.failInflight("mcp-lazy: the server exited or stopped accepting input")
+			r.discardChild = true
+			r.stopChild()
+		case <-r.startTick:
+			r.log("startup exceeded %s", r.startTimeout)
+			r.failInflight("mcp-lazy: server startup timed out after " + r.startTimeout.String())
+			r.queue = nil
+			r.checkIDs = map[string]string{}
+			r.starting = false
+			r.discardChild = true
+			r.stopChild()
 		case <-idle:
 			if r.running && !r.starting && len(r.inflight) == 0 && len(r.serverInflight) == 0 && r.entry() != nil {
 				r.log("idle for %s, stopping the server", r.idleStop)
@@ -420,6 +483,9 @@ func (r *relay) fromClient(line []byte) {
 			r.log("no recorded handshake for protocol %q, starting the server", r.proto)
 		}
 		r.forward(line, &m)
+		if r.running {
+			r.beginStartup()
+		}
 	case m.Method == "notifications/initialized":
 		r.initialized = true
 		if r.running && !r.starting {
@@ -490,25 +556,76 @@ func (r *relay) forward(line []byte, m *message) {
 
 func (r *relay) startChild(replayHandshake bool) error {
 	cmd := exec.Command(r.command[0], r.command[1:]...)
+	configureProcess(cmd)
 	cmd.Stderr = os.Stderr
 	stdin, err := cmd.StdinPipe()
 	if err != nil {
 		return err
 	}
-	stdout, err := cmd.StdoutPipe()
+	// Own the pipe so Wait cannot close it before the reader consumes final responses.
+	stdout, output, err := os.Pipe()
 	if err != nil {
+		stdin.Close()
 		return err
 	}
+	cmd.Stdout = output
 	if err := cmd.Start(); err != nil {
+		stdin.Close()
+		stdout.Close()
+		output.Close()
 		return err
 	}
+	output.Close()
 	r.spawns++
 	r.cmd, r.childIn, r.running = cmd, stdin, true
+	r.discardChild = false
+	r.childWrites = make(chan []byte, 64)
+	r.writeErrors = make(chan error, 1)
+	r.writeStop = make(chan struct{})
+	writes, errors, quit := r.childWrites, r.writeErrors, r.writeStop
+	go func() {
+		for {
+			select {
+			case <-quit:
+				return
+			case line := <-writes:
+				if line == nil {
+					stdin.Close()
+					return
+				}
+				if _, err := stdin.Write(line); err != nil {
+					select {
+					case errors <- err:
+					case <-quit:
+					}
+					return
+				}
+			}
+		}
+	}()
+	// Each generation has its own channels; stale output cannot enter a new child.
+	r.childLines = make(chan []byte, 64)
+	r.childDone = make(chan error, 1)
 	lines, done := r.childLines, r.childDone
+	readDone := make(chan struct{})
 	go func() {
 		readLines(stdout, lines)
-		done <- cmd.Wait()
+		stdout.Close()
+		close(readDone)
 	}()
+	go func() {
+		err := cmd.Wait()
+		// A launcher may exit while its children still hold stdout open.
+		killProcessGroup(cmd)
+		select {
+		case <-readDone:
+		case <-time.After(250 * time.Millisecond):
+			stdout.Close()
+			<-readDone
+		}
+		done <- err
+	}()
+	r.beginStartup()
 	r.log("server started (pid %d)", cmd.Process.Pid)
 	if replayHandshake {
 		r.starting = true
@@ -519,13 +636,24 @@ func (r *relay) startChild(replayHandshake bool) error {
 }
 
 func (r *relay) writeChild(line []byte) {
-	if r.childIn == nil {
+	if r.childIn == nil || r.stopping {
 		return
 	}
-	r.childIn.Write(append(append([]byte{}, line...), '\n'))
+	// A child that does not read stdin must not block the startup timer.
+	copy := append(append([]byte{}, line...), '\n')
+	select {
+	case r.childWrites <- copy:
+	default:
+		r.failInflight("mcp-lazy: server input queue is full")
+		r.discardChild = true
+		r.stopChild()
+	}
 }
 
 func (r *relay) fromChild(line []byte) {
+	if r.discardChild {
+		return
+	}
 	var m message
 	if line[0] != '{' || json.Unmarshal(line, &m) != nil {
 		r.toClient(line)
@@ -551,6 +679,7 @@ func (r *relay) fromChild(line []byte) {
 		if method, ok := r.checkIDs[id]; ok {
 			delete(r.checkIDs, id)
 			r.verifyList(method, &m)
+			r.finishStartupIfReady()
 			return
 		}
 	}
@@ -566,6 +695,7 @@ func (r *relay) fromChild(line []byte) {
 		r.learn(method, m.Result, skip)
 	}
 	r.toClient(line)
+	r.finishStartupIfReady()
 }
 
 // learnEarly records the answer to a request made ahead of initialize.
@@ -631,6 +761,7 @@ func (r *relay) handshakeDone(m *message) {
 		r.log("the server refused the replayed handshake")
 		r.failInflight("mcp-lazy: the server refused the handshake")
 		r.queue = nil
+		r.discardChild = true
 		r.stopChild()
 		return
 	}
@@ -652,6 +783,7 @@ func (r *relay) handshakeDone(m *message) {
 		r.writeChild(line)
 	}
 	r.queue = nil
+	r.finishStartupIfReady()
 }
 
 var listChanged = map[string]string{
@@ -692,6 +824,12 @@ func (r *relay) drainChild() {
 
 func (r *relay) childExited(err error) {
 	r.log("server exited (%v)", err)
+	r.endStartup()
+	if r.writeStop != nil {
+		close(r.writeStop)
+		r.writeStop = nil
+	}
+	r.childWrites, r.writeErrors = nil, nil
 	r.running, r.starting, r.cmd, r.childIn = false, false, nil, nil
 	r.queue = nil
 	r.checkIDs = map[string]string{}
@@ -711,19 +849,58 @@ func (r *relay) failInflight(text string) {
 
 // stopChild closes the server's input, waits briefly, then ends it.
 func (r *relay) stopChild() {
-	if !r.running || r.cmd == nil {
+	if !r.running || r.cmd == nil || r.stopping {
 		return
 	}
-	r.childIn.Close()
-	if r.waitChild(3 * time.Second) {
+	r.stopping = true
+	defer func() { r.stopping = false }()
+	r.endStartup()
+	cmd := r.cmd
+	select {
+	case r.childWrites <- nil:
+	default:
+		r.childIn.Close()
+	}
+	if r.waitChild(250 * time.Millisecond) {
 		return
 	}
-	r.cmd.Process.Signal(syscall.SIGTERM)
-	if r.waitChild(2 * time.Second) {
+	terminateProcessGroup(cmd)
+	if r.waitChild(500 * time.Millisecond) {
 		return
 	}
-	r.cmd.Process.Kill()
-	r.waitChild(time.Hour)
+	killProcessGroup(cmd)
+	if !r.waitChild(time.Second) {
+		// Do not restart while a generation has not been reaped.
+		r.log("server did not exit after SIGKILL")
+		os.Exit(1)
+	}
+}
+
+func (r *relay) beginStartup() {
+	if r.startTick != nil {
+		return
+	}
+	r.startTimer = time.NewTimer(r.startTimeout)
+	r.startTick = r.startTimer.C
+}
+
+func (r *relay) endStartup() {
+	if r.startTimer != nil {
+		r.startTimer.Stop()
+	}
+	r.startTimer, r.startTick = nil, nil
+}
+
+func (r *relay) finishStartupIfReady() {
+	if r.starting || len(r.checkIDs) != 0 || len(r.early) != 0 {
+		return
+	}
+	for _, method := range r.inflight {
+		if method == "initialize" {
+			return
+		}
+	}
+	r.endStartup()
 }
 
 // waitChild keeps passing the server's remaining output on while it waits for the exit.

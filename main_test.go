@@ -2,13 +2,17 @@ package main
 
 import (
 	"bufio"
+	"context"
 	"encoding/json"
 	"fmt"
 	"io"
 	"os"
 	"os/exec"
+	"os/signal"
 	"path/filepath"
+	"strconv"
 	"strings"
+	"syscall"
 	"testing"
 	"time"
 )
@@ -16,6 +20,13 @@ import (
 var relayBinary string
 
 func TestMain(m *testing.M) {
+	if os.Getenv("MCP_LAZY_FAKE_GRANDCHILD") == "1" {
+		signal.Ignore(syscall.SIGTERM)
+		os.WriteFile(os.Getenv("FAKE_GRANDCHILD_PID"), []byte(strconv.Itoa(os.Getpid())), 0o600)
+		for {
+			time.Sleep(time.Hour)
+		}
+	}
 	if os.Getenv("MCP_LAZY_FAKE_SERVER") == "1" {
 		fakeServer()
 		return
@@ -25,7 +36,12 @@ func TestMain(m *testing.M) {
 		panic(err)
 	}
 	relayBinary = filepath.Join(dir, "mcp-lazy")
-	if out, err := exec.Command("go", "build", "-o", relayBinary, ".").CombinedOutput(); err != nil {
+	buildArgs := []string{"build", "-o", relayBinary}
+	if os.Getenv("MCP_LAZY_TEST_RACE") == "1" {
+		buildArgs = append(buildArgs, "-race")
+	}
+	buildArgs = append(buildArgs, ".")
+	if out, err := exec.Command("go", buildArgs...).CombinedOutput(); err != nil {
 		panic(string(out))
 	}
 	code := m.Run()
@@ -43,6 +59,24 @@ func fakeServer() {
 		}
 	}
 	note("start")
+	if os.Getenv("FAKE_IGNORE_STOP") == "1" {
+		signal.Ignore(syscall.SIGTERM)
+	}
+	if path := os.Getenv("FAKE_GRANDCHILD_PID"); path != "" {
+		child := exec.Command(os.Args[0], "-test.run=^$")
+		child.Env = append(os.Environ(), "MCP_LAZY_FAKE_SERVER=0", "MCP_LAZY_FAKE_GRANDCHILD=1")
+		child.Stdout = os.Stdout
+		child.Stderr = os.Stderr
+		if child.Start() != nil {
+			os.Exit(4)
+		}
+		go child.Wait()
+	}
+	if os.Getenv("FAKE_NEVER_READ") == "1" {
+		for {
+			time.Sleep(time.Hour)
+		}
+	}
 	tools := os.Getenv("FAKE_TOOLS")
 	if tools == "" {
 		tools = "echo"
@@ -61,6 +95,12 @@ func fakeServer() {
 			json.Unmarshal(line, &m)
 			switch m.Method {
 			case "initialize":
+				if marker := os.Getenv("FAKE_HANG_MARKER"); marker != "" {
+					if _, err := os.Stat(marker); err == nil {
+						note("hang initialize")
+						continue
+					}
+				}
 				var p struct {
 					ClientInfo struct {
 						Name string `json:"name"`
@@ -68,18 +108,52 @@ func fakeServer() {
 				}
 				json.Unmarshal(m.Params, &p)
 				note("initialize client=" + p.ClientInfo.Name)
-				send(`{"jsonrpc":"2.0","id":` + string(m.ID) + `,"result":{"protocolVersion":"2025-06-18","capabilities":{"tools":{"listChanged":true}},"serverInfo":{"name":"fake","version":"1"},"instructions":"fake instructions"}}`)
+				capabilities := `{"tools":{"listChanged":true}}`
+				if os.Getenv("FAKE_ALL_LISTS") == "1" {
+					capabilities = `{"tools":{},"prompts":{},"resources":{}}`
+				}
+				send(`{"jsonrpc":"2.0","id":` + string(m.ID) + `,"result":{"protocolVersion":"2025-06-18","capabilities":` + capabilities + `,"serverInfo":{"name":"fake","version":"1"},"instructions":"fake instructions"}}`)
 			case "server/discover":
+				if marker := os.Getenv("FAKE_HANG_DISCOVER_MARKER"); marker != "" {
+					if _, err := os.Stat(marker); err == nil {
+						note("hang discover")
+						continue
+					}
+				}
 				note("discover")
 				send(`{"jsonrpc":"2.0","id":` + string(m.ID) + `,"error":{"code":-32601,"message":"Method not found"}}`)
 			case "notifications/initialized":
 				note("initialized")
 			case "tools/list":
+				if marker := os.Getenv("FAKE_HANG_LIST_MARKER"); marker != "" {
+					if _, err := os.Stat(marker); err == nil {
+						note("hang list")
+						continue
+					}
+				}
+				if os.Getenv("FAKE_HANG_LISTS") == "1" {
+					note("hang list")
+					continue
+				}
+				if os.Getenv("FAKE_LIST_ERROR") == "1" {
+					send(`{"jsonrpc":"2.0","id":` + string(m.ID) + `,"error":{"code":-32000,"message":"list unavailable"}}`)
+					continue
+				}
 				var list []string
 				for _, name := range strings.Split(tools, ",") {
 					list = append(list, `{"name":"`+name+`", "description":"a <b> & c", "inputSchema":{"type":"object"}}`)
 				}
-				send(`{"jsonrpc":"2.0","id":` + string(m.ID) + `,"result":{"tools":[` + strings.Join(list, ",") + `]}}`)
+				cursor := ""
+				if os.Getenv("FAKE_PAGINATED") == "1" && !strings.Contains(string(m.Params), "cursor") {
+					cursor = `,"nextCursor":"page2"`
+				}
+				send(`{"jsonrpc":"2.0","id":` + string(m.ID) + `,"result":{"tools":[` + strings.Join(list, ",") + `]` + cursor + `}}`)
+			case "prompts/list":
+				send(`{"jsonrpc":"2.0","id":` + string(m.ID) + `,"result":{"prompts":[{"name":"hello"}]}}`)
+			case "resources/list":
+				send(`{"jsonrpc":"2.0","id":` + string(m.ID) + `,"result":{"resources":[{"uri":"test://one","name":"one"}]}}`)
+			case "resources/templates/list":
+				send(`{"jsonrpc":"2.0","id":` + string(m.ID) + `,"result":{"resourceTemplates":[{"uriTemplate":"test://{id}","name":"template"}]}}`)
 			case "tools/call":
 				var p struct {
 					Name string          `json:"name"`
@@ -90,15 +164,75 @@ func fakeServer() {
 				if p.Name == "crash" {
 					os.Exit(3)
 				}
+				if p.Name == "slow" {
+					time.Sleep(400 * time.Millisecond)
+				}
 				cwd, _ := os.Getwd()
 				text, _ := json.Marshal("env=" + os.Getenv("FAKE_SEAT") + " cwd=" + cwd)
-				send(`{"jsonrpc":"2.0","id":` + string(m.ID) + `,"result":{"content":[{"type":"text","text":` + string(text) + `}]}}`)
+				send(`{"jsonrpc":"2.0","id":` + string(m.ID) + `,"result":{"content":[{"type":"text","text":` + string(text) + `}],"_meta":{"threadId":"reply-thread","nested":[1,true]}},"extension":"retained"}`)
 			}
 		}
 		if err != nil {
 			note("eof")
+			if os.Getenv("FAKE_IGNORE_STOP") == "1" {
+				for {
+					time.Sleep(time.Hour)
+				}
+			}
 			return
 		}
+	}
+}
+
+func TestStartupTimeoutWhenServerDoesNotReadLargeInitialize(t *testing.T) {
+	dir := t.TempDir()
+	c := start(t, dir, []string{"FAKE_NEVER_READ=1"}, "--start-timeout", "100ms")
+	payload, _ := json.Marshal(map[string]any{"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": map[string]any{"protocolVersion": "2025-06-18", "capabilities": map[string]any{}, "clientInfo": map[string]string{"name": "seat", "version": "1"}, "large": strings.Repeat("x", 1<<20)}})
+	c.send(string(payload))
+	if m, _ := c.answer("1"); !strings.Contains(string(m["error"]), "timed out") {
+		t.Fatalf("expected timeout: %v", m)
+	}
+	c.close()
+}
+
+func TestGrandchildCleanupOnSignalIdleAndStartupTimeout(t *testing.T) {
+	for _, action := range []string{"signal", "idle", "timeout", "kill-escalation"} {
+		t.Run(action, func(t *testing.T) {
+			dir := t.TempDir()
+			path := filepath.Join(dir, "grandchild.pid")
+			env := []string{"FAKE_GRANDCHILD_PID=" + path}
+			flags := []string{"--start-timeout", "100ms"}
+			if action == "idle" {
+				flags = append(flags, "--idle-stop", "100ms")
+			}
+			if action == "timeout" {
+				env = append(env, "FAKE_NEVER_READ=1")
+			}
+			if action == "kill-escalation" {
+				env = append(env, "FAKE_IGNORE_STOP=1")
+			}
+			c := start(t, dir, env, flags...)
+			if action == "timeout" {
+				c.send(`{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18"}}`)
+			} else {
+				c.handshake("seat")
+			}
+			pid := waitGrandchild(t, path)
+			switch action {
+			case "signal":
+				c.cmd.Process.Signal(syscall.SIGTERM)
+				c.close()
+			case "idle":
+				c.waitLog("eof")
+			case "timeout":
+				if m, _ := c.answer("1"); !strings.Contains(string(m["error"]), "timed out") {
+					t.Fatalf("expected timeout: %v", m)
+				}
+			case "kill-escalation":
+				c.close()
+			}
+			assertGrandchildStopped(t, pid)
+		})
 	}
 }
 
@@ -117,6 +251,12 @@ func start(t *testing.T, dir string, env []string, flags ...string) *client {
 	c := &client{t: t, log: filepath.Join(dir, "server.log"), cache: filepath.Join(dir, "cache"), lines: make(chan string, 64)}
 	args := append([]string{"--cache-dir", c.cache}, flags...)
 	args = append(args, "--", os.Args[0], "-test.run=^$")
+	return startArgs(t, dir, env, args)
+}
+
+func startArgs(t *testing.T, dir string, env, args []string) *client {
+	t.Helper()
+	c := &client{t: t, log: filepath.Join(dir, "server.log"), cache: filepath.Join(dir, "cache"), lines: make(chan string, 64)}
 	c.cmd = exec.Command(relayBinary, args...)
 	c.cmd.Dir = dir
 	c.cmd.Env = append(os.Environ(), "MCP_LAZY_FAKE_SERVER=1", "FAKE_LOG="+c.log)
@@ -145,16 +285,257 @@ func start(t *testing.T, dir string, env []string, flags ...string) *client {
 	return c
 }
 
+func checkCommand(t *testing.T, dir string, env []string, flags ...string) ([]byte, []byte, error) {
+	t.Helper()
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	args := append([]string{"--check", "--cache-dir", filepath.Join(dir, "cache"), "--start-timeout", "1s"}, flags...)
+	args = append(args, "--", os.Args[0], "-test.run=^$")
+	cmd := exec.CommandContext(ctx, relayBinary, args...)
+	cmd.Dir = dir
+	cmd.Env = append(os.Environ(), "MCP_LAZY_FAKE_SERVER=1", "FAKE_LOG="+filepath.Join(dir, "server.log"))
+	cmd.Env = append(cmd.Env, env...)
+	var stdout, stderr strings.Builder
+	cmd.Stdout, cmd.Stderr = &stdout, &stderr
+	err := cmd.Run()
+	if ctx.Err() != nil {
+		t.Fatal("check did not finish within 5s")
+	}
+	return []byte(stdout.String()), []byte(stderr.String()), err
+}
+
+func TestColdInitializeTimeoutAndRetry(t *testing.T) {
+	dir := t.TempDir()
+	marker := filepath.Join(dir, "hang")
+	os.WriteFile(marker, []byte("hang"), 0o600)
+	c := start(t, dir, []string{"FAKE_HANG_MARKER=" + marker}, "--start-timeout", "100ms")
+	c.send(`{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"cold","version":"1"}}}`)
+	if m, _ := c.answer("1"); !strings.Contains(string(m["error"]), "timed out") {
+		t.Fatalf("expected timeout: %v", m)
+	}
+	os.Remove(marker)
+	c.handshake("retry")
+	if got := strings.Count(c.serverLog(), "start"); got != 2 {
+		t.Fatalf("got %d starts, want 2", got)
+	}
+}
+
+func TestCachedInitializeTimeoutFailsQueuedRequestsAndRetries(t *testing.T) {
+	dir := t.TempDir()
+	record(t, dir, nil)
+	marker := filepath.Join(dir, "hang")
+	os.WriteFile(marker, []byte("hang"), 0o600)
+	c := start(t, dir, []string{"FAKE_HANG_MARKER=" + marker}, "--start-timeout", "100ms")
+	c.handshake("warm")
+	c.send(`{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"echo"}}`)
+	c.send(`{"jsonrpc":"2.0","id":4,"method":"tools/call","params":{"name":"echo"}}`)
+	seen := map[string]bool{}
+	for len(seen) < 2 {
+		m := c.read()
+		if !strings.Contains(string(m["error"]), "timed out") {
+			t.Fatalf("expected timeout: %v", m)
+		}
+		seen[string(m["id"])] = true
+	}
+	if !seen["3"] || !seen["4"] {
+		t.Fatalf("wrong ids: %v", seen)
+	}
+	os.Remove(marker)
+	c.send(`{"jsonrpc":"2.0","id":5,"method":"tools/call","params":{"name":"echo"}}`)
+	if m, _ := c.answer("5"); m["result"] == nil {
+		t.Fatalf("retry failed: %v", m)
+	}
+	if strings.Contains(c.serverLog(), "call echo") && strings.Count(c.serverLog(), "call echo") != 1 {
+		t.Fatal("timed-out queued calls were replayed")
+	}
+}
+
+func TestStartupDeadlineDoesNotLimitOrdinaryToolCalls(t *testing.T) {
+	dir := t.TempDir()
+	record(t, dir, nil)
+	c := start(t, dir, nil, "--start-timeout", "100ms")
+	c.handshake("seat")
+	c.send(`{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"slow"}}`)
+	if m, _ := c.answer("3"); m["result"] == nil {
+		t.Fatalf("ordinary call was timed out: %v", m)
+	}
+}
+
+func TestEnvironmentConfigurationWithoutOptionsAndCLIOverride(t *testing.T) {
+	dir := t.TempDir()
+	c := startArgs(t, dir, []string{"MCP_LAZY_CACHE_DIR=" + filepath.Join(dir, "cache"), "MCP_LAZY_START_TIMEOUT=2s", "MCP_LAZY_IDLE_STOP=0", "MCP_LAZY_LOG_FILE=" + filepath.Join(dir, "relay.log"), "MCP_LAZY_VERBOSE=false"}, []string{os.Args[0], "-test.run=^$"})
+	c.handshake("env")
+	c.close()
+	if files, _ := os.ReadDir(c.cache); len(files) != 1 {
+		t.Fatalf("env cache not created: %v", files)
+	}
+	if info, err := os.Stat(filepath.Join(dir, "relay.log")); err != nil || info.Size() == 0 {
+		t.Fatal("env log not created")
+	}
+	c = start(t, dir, []string{"MCP_LAZY_START_TIMEOUT=invalid"}, "--start-timeout", "1s")
+	c.handshake("override")
+}
+
+func TestInvalidEnvironmentOrDurationRejected(t *testing.T) {
+	for _, value := range []string{"invalid", "0", "-1s"} {
+		t.Run(value, func(t *testing.T) {
+			cmd := exec.Command(relayBinary, os.Args[0], "-test.run=^$")
+			cmd.Env = append(os.Environ(), "MCP_LAZY_START_TIMEOUT="+value)
+			if out, err := cmd.CombinedOutput(); err == nil {
+				t.Fatalf("invalid duration accepted: %s", out)
+			} else if exit, ok := err.(*exec.ExitError); !ok || exit.ExitCode() != 2 {
+				t.Fatalf("wrong exit: %v", err)
+			}
+		})
+	}
+}
+
+func TestCheckRecordsAndNextSessionStaysLazy(t *testing.T) {
+	dir := t.TempDir()
+	out, stderr, err := checkCommand(t, dir, nil)
+	if err != nil {
+		t.Fatalf("check failed: %v %s", err, stderr)
+	}
+	var report struct {
+		OK    bool `json:"ok"`
+		Lists map[string]struct {
+			Count  int
+			Cached bool
+		} `json:"lists"`
+	}
+	if json.Unmarshal(out, &report) != nil || !report.OK || report.Lists["tools/list"].Count != 1 || !report.Lists["tools/list"].Cached {
+		t.Fatalf("bad report: %s", out)
+	}
+	if log, _ := os.ReadFile(filepath.Join(dir, "server.log")); !strings.Contains(string(log), "eof") {
+		t.Fatal("check did not clean up server")
+	}
+	os.Remove(filepath.Join(dir, "server.log"))
+	c := start(t, dir, nil)
+	c.handshake("seat")
+	if log := c.serverLog(); log != "" {
+		t.Fatalf("check cache did not make session lazy: %s", log)
+	}
+}
+
+func TestCheckTimeoutAndListFailureLeaveOldCacheIntact(t *testing.T) {
+	for _, behavior := range []string{"FAKE_HANG_LISTS=1", "FAKE_LIST_ERROR=1"} {
+		t.Run(behavior, func(t *testing.T) {
+			dir := t.TempDir()
+			record(t, dir, nil)
+			files, _ := os.ReadDir(filepath.Join(dir, "cache"))
+			path := filepath.Join(dir, "cache", files[0].Name())
+			before, _ := os.ReadFile(path)
+			out, stderr, err := checkCommand(t, dir, []string{behavior}, "--start-timeout", "100ms")
+			if err == nil || len(out) != 0 || len(stderr) == 0 {
+				t.Fatalf("check should fail without report: %s %s %v", out, stderr, err)
+			}
+			after, _ := os.ReadFile(path)
+			if string(before) != string(after) {
+				t.Fatal("failed check modified cache")
+			}
+		})
+	}
+}
+
+func TestCheckPaginationIsCountedButNotCachedAsOnePage(t *testing.T) {
+	dir := t.TempDir()
+	out, stderr, err := checkCommand(t, dir, []string{"FAKE_PAGINATED=1"})
+	if err != nil {
+		t.Fatalf("check failed: %v %s", err, stderr)
+	}
+	var report struct {
+		Lists map[string]struct {
+			Count  int
+			Pages  int
+			Cached bool
+		} `json:"lists"`
+	}
+	json.Unmarshal(out, &report)
+	list := report.Lists["tools/list"]
+	if list.Count != 2 || list.Pages != 2 || list.Cached {
+		t.Fatalf("wrong paginated report: %s", out)
+	}
+}
+
+func TestResultsAndMetaAreForwarded(t *testing.T) {
+	dir := t.TempDir()
+	c := start(t, dir, nil)
+	c.handshake("seat")
+	c.send(`{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"echo","_meta":{"threadId":"caller"}}}`)
+	m, _ := c.answer("3")
+	if string(m["extension"]) != `"retained"` || !strings.Contains(string(m["result"]), `"threadId":"reply-thread"`) || !strings.Contains(c.serverLog(), `meta={"threadId":"caller"}`) {
+		t.Fatalf("meta or envelope lost: %v", m)
+	}
+}
+
+func waitGrandchild(t *testing.T, path string) int {
+	t.Helper()
+	deadline := time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) {
+		if data, err := os.ReadFile(path); err == nil {
+			pid, err := strconv.Atoi(string(data))
+			if err == nil && pid > 0 {
+				return pid
+			}
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	t.Fatal("grandchild never started")
+	return 0
+}
+
+func assertGrandchildStopped(t *testing.T, pid int) {
+	t.Helper()
+	deadline := time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) {
+		if syscall.Kill(pid, 0) != nil {
+			return
+		}
+		// Linux may leave a zombie for the container's init to reap. It is no longer executing.
+		if data, err := os.ReadFile(fmt.Sprintf("/proc/%d/stat", pid)); err == nil {
+			if fields := strings.Fields(string(data)); len(fields) > 2 && fields[2] == "Z" {
+				return
+			}
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	t.Fatalf("grandchild %d still executing", pid)
+}
+
+func TestGrandchildCleanupOnEOFAndUnexpectedParentExit(t *testing.T) {
+	for _, crash := range []bool{false, true} {
+		t.Run(fmt.Sprint(crash), func(t *testing.T) {
+			dir := t.TempDir()
+			path := filepath.Join(dir, "grandchild.pid")
+			c := start(t, dir, []string{"FAKE_GRANDCHILD_PID=" + path})
+			c.handshake("seat")
+			pid := waitGrandchild(t, path)
+			if crash {
+				c.send(`{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"crash"}}`)
+				if m, _ := c.answer("3"); m["error"] == nil {
+					t.Fatalf("missing crash error: %v", m)
+				}
+			} else {
+				c.close()
+			}
+			assertGrandchildStopped(t, pid)
+		})
+	}
+}
+
 func (c *client) close() {
 	if c.closed {
 		return
 	}
 	c.closed = true
 	c.in.Close()
-	done := make(chan struct{})
-	go func() { c.cmd.Wait(); close(done) }()
+	done := make(chan error, 1)
+	go func() { done <- c.cmd.Wait() }()
 	select {
-	case <-done:
+	case err := <-done:
+		if err != nil {
+			c.t.Errorf("mcp-lazy exited with an error: %v", err)
+		}
 	case <-time.After(10 * time.Second):
 		c.cmd.Process.Kill()
 		c.t.Error("mcp-lazy did not exit after its input closed")
