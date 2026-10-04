@@ -42,6 +42,7 @@ type registration struct {
 	HadEnv     *bool              `json:"hadEnv,omitempty"`
 	Managed    envFlags           `json:"managedEnv"`
 	BaseEnv    map[string]*string `json:"baseEnv"`
+	Recover    bool               `json:"-"`
 }
 
 func configCommand(args []string) int {
@@ -61,9 +62,14 @@ func configCommand(args []string) int {
 	stateDir := fs.String("state-dir", "", "persistent registration metadata and backups directory")
 	relayPath := fs.String("relay", "", "absolute relay binary (default: this executable)")
 	dryRun := fs.Bool("dry-run", false, "report changed field names without writing files or revealing values")
+	recover := fs.Bool("recover", false, "unwrap a recognizable relay without saved metadata; preserve env")
 	managed := envFlags{}
 	fs.Var(managed, "env", "MCP_LAZY_NAME=value; repeat to set relay options")
 	if err := fs.Parse(args[1:]); err != nil {
+		return 2
+	}
+	if *recover && action != "unwrap" {
+		fmt.Fprintln(os.Stderr, "mcp-lazy: --recover is only supported for config unwrap")
 		return 2
 	}
 	if fs.NArg() != 0 || *config == "" || *server == "" || (*client != "claude" && *client != "cursor" && *client != "codex" && *client != "grok") {
@@ -109,7 +115,7 @@ func configCommand(args []string) int {
 			return 2
 		}
 	}
-	reg := registration{Schema: 1, Client: *client, Config: path, Server: *server, Relay: *relayPath, Managed: managed, BaseEnv: map[string]*string{}}
+	reg := registration{Schema: 1, Client: *client, Config: path, Server: *server, Relay: *relayPath, Managed: managed, BaseEnv: map[string]*string{}, Recover: *recover}
 	if err := manageRegistration(action, reg, *stateDir, *dryRun); err != nil {
 		fmt.Fprintln(os.Stderr, "mcp-lazy:", err)
 		return 1
@@ -201,6 +207,16 @@ func manageRegistration(action string, requested registration, stateDir string, 
 	return manageRegistrationWithWrite(action, requested, stateDir, dryRun, atomicWriteChecked)
 }
 
+func relayCommand(command, relay string) bool {
+	return command == relay || strings.HasPrefix(strings.ToLower(filepath.Base(command)), "mcp-lazy")
+}
+
+// Metadata-free recovery only understands registrations written without relay
+// options in args. Never guess how to parse flags or peel a nested wrapper.
+func recoverableRelay(command string, args []string, relay string) bool {
+	return relayCommand(command, relay) && len(args) > 0 && args[0] != "" && !strings.HasPrefix(args[0], "-") && !relayCommand(args[0], relay)
+}
+
 func manageRegistrationWithWrite(action string, requested registration, stateDir string, dryRun bool, write func(string, []byte, os.FileMode, func() error) error) error {
 	key := digest(requested.Client + "\n" + requested.Config + "\n" + requested.Server)
 	statePath := filepath.Join(stateDir, key+".json")
@@ -249,16 +265,30 @@ func manageRegistrationWithWrite(action string, requested registration, stateDir
 	}
 	command := entry["command"].(string)
 	wrapped := exists && (command == stored.Relay || (stored.PriorRelay != "" && command == stored.PriorRelay))
+	unmanagedRelay := !wrapped && relayCommand(command, requested.Relay)
+	recoverable := !exists && recoverableRelay(command, args, requested.Relay)
 	if action == "status" {
-		return json.NewEncoder(os.Stdout).Encode(map[string]any{"managed": exists, "wrapped": wrapped, "client": requested.Client, "file": requested.Config, "server": requested.Server})
+		return json.NewEncoder(os.Stdout).Encode(map[string]any{"managed": exists, "wrapped": wrapped || unmanagedRelay, "recoverable": recoverable, "client": requested.Client, "file": requested.Config, "server": requested.Server})
+	}
+	if action == "unwrap" && !exists && requested.Recover {
+		if !recoverable {
+			return fmt.Errorf("cannot recover this registration; expected a recognizable relay with the original command first in args")
+		}
+		// Lost metadata cannot tell which env values were managed or whether
+		// the original args key existed. Preserve env and an explicit array.
+		wrapped = true
+		requested.HadArgs = true
+		requested.Managed = envFlags{}
 	}
 	if action != "wrap" && !exists {
-		return fmt.Errorf("no saved registration; use config wrap first")
+		if !(action == "unwrap" && requested.Recover && recoverable) {
+			return fmt.Errorf("no saved registration; use config wrap first, or config unwrap --recover for a recognizable unmanaged relay")
+		}
 	}
 	if wrapped && len(args) == 0 {
 		return fmt.Errorf("wrapped registration has no original command")
 	}
-	if !wrapped && (command == requested.Relay || filepath.Base(command) == "mcp-lazy") {
+	if !wrapped && unmanagedRelay {
 		return fmt.Errorf("registration points at an unmanaged relay; refusing to nest wrappers")
 	}
 	reg := requested
@@ -384,7 +414,11 @@ func manageRegistrationWithWrite(action string, requested registration, stateDir
 		return err
 	}
 	if dryRun {
-		return json.NewEncoder(os.Stdout).Encode(map[string]any{"action": action, "dryRun": true, "file": requested.Config, "server": requested.Server, "changedFields": changed})
+		report := map[string]any{"action": action, "dryRun": true, "file": requested.Config, "server": requested.Server, "changedFields": changed}
+		if action == "unwrap" && !exists {
+			report["recovered"], report["environmentPreserved"] = true, true
+		}
+		return json.NewEncoder(os.Stdout).Encode(report)
 	}
 	// setup/register is an external writer: reject changes noticed since reading.
 	if len(changed) > 0 {
@@ -447,12 +481,16 @@ func manageRegistrationWithWrite(action string, requested registration, stateDir
 			return fmt.Errorf("writing configuration failed: %w; backup is retained", err)
 		}
 	}
-	if action == "unwrap" {
+	if action == "unwrap" && exists {
 		if err := os.Remove(statePath); err != nil {
 			return fmt.Errorf("removing saved registration failed")
 		}
 	}
-	return json.NewEncoder(os.Stdout).Encode(map[string]any{"action": action, "file": requested.Config, "server": requested.Server, "changedFields": changed})
+	report := map[string]any{"action": action, "file": requested.Config, "server": requested.Server, "changedFields": changed}
+	if action == "unwrap" && !exists {
+		report["recovered"], report["environmentPreserved"] = true, true
+	}
+	return json.NewEncoder(os.Stdout).Encode(report)
 }
 
 func stringsToAny(items []string) []any {

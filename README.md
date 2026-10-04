@@ -4,7 +4,7 @@ A small stdio MCP relay that starts the real server when it is needed. Recorded
 initialization and listings let unused servers stay asleep. Once started, the
 server stays alive by default, preserving its in-memory session state.
 
-Version 0.3.1 is a Linux trial build. Real-client acceptance for this version is
+Version 0.3.2 is a Linux trial build. Real-client acceptance for this version is
 pending. A license has not been selected yet.
 
 Source: https://github.com/kitepon/mcp-lazy
@@ -245,6 +245,33 @@ for that metadata. If 0.3.0 reapply already saved a relay override as its origin
 value, recover the original value from its pre-wrap backup before wrapping again;
 the intended original cannot be inferred from the overwritten metadata.
 
+If an external writer restores an old wrapped configuration after a successful
+unwrap deleted its metadata, `config status` reports `wrapped: true`,
+`managed: false` and, for a supported shape, `recoverable: true`. A relay is
+recognized by its command matching `--relay` (this executable by default), or
+by a basename beginning with `mcp-lazy`, ignoring case. This name check is a
+recognition convention; it does not verify the executable's contents.
+
+After stopping external writers, explicitly recover the command and arguments:
+
+```sh
+mcp-lazy config unwrap --recover --client cursor \
+  --file /absolute/path/to/config.json --server example \
+  --state-dir /absolute/path/to/registration-state --dry-run
+# Inspect changedFields, then repeat without --dry-run.
+```
+
+Metadata-free recovery requires the original nonempty command to be first in
+`args`, followed by its arguments. A first argument beginning with `-`, a missing
+command or another recognizable relay is rejected. Recovery leaves all `env`
+values intact because their original values and ownership are unknown. An
+explicit `args` array remains, including an empty array: the original presence
+of that key is also unknown. The report includes `recovered: true` and
+`environmentPreserved: true`. Consult the pre-wrap backup to restore original
+environment values. If valid metadata exists, ordinary restoration uses it even
+when `--recover` is supplied; invalid metadata is still rejected. Normal wrap
+and reapply continue to refuse unmanaged relays instead of nesting wrappers.
+
 `--dry-run` validates the edited document and reports changed field names without
 writing files or printing values. Changed configuration files are backed up in
 `<state-dir>/backups/`; backups and registration metadata have mode 0600. They may
@@ -258,6 +285,11 @@ must use ordinary or dotted table keys; an enclosing inline-table registration
 is rejected without writing the configuration. Inline `env` tables are supported.
 HTTP registrations and unmanaged nested relays are rejected.
 
+Unwrap restores the decoded settings rather than the original byte representation
+of edited fields. JSON argument arrays can become a single line; TOML keys can
+be quoted and removed expressions can leave blank lines. Unedited settings and
+bytes retain the guarantees above.
+
 Use one state directory for all relay edits to a configuration file. Relay
 commands serialize those edits on Linux/macOS. External setup/register commands
 do not share that lock. Stop clients and other programs that can write the file
@@ -267,6 +299,9 @@ before applying changes; in particular, close Claude sessions before editing
 Immediately before replacing the configuration, the command checks that its
 contents, file identity and permissions still match what was read. A detected
 change aborts the write, restores registration metadata and retains the backup.
+Backups from rejected edits are also retained and can accumulate during repeated
+conflicts. There is no automatic pruning; review and remove unneeded backups
+after confirming the recovered configuration.
 This is an optimistic check, not an atomic compare-and-swap with external writers:
 a write between the final check and rename can still be lost. An offline editing
 window is required for safe use. This command does not monitor files or restart an
@@ -303,7 +338,8 @@ version changes; SIGHUP cleanup; wake conditions, deadlines and ordinary calls
 during a predicate; and JSON/TOML wrapping, repeated application, setup changes,
 restoration, backups, exact preservation of unedited JSON bytes, missing/empty
 environment restoration, setup-retained overrides and late-write conflict
-rejection with registration-state rollback.
+rejection with registration-state rollback; and explicit recovery after a stale
+external write restores a wrapper whose metadata was deleted.
 
 With Node.js and the real server executables available, an optional isolated
 protocol smoke test compares discovery, initialization and listings with a

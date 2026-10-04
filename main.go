@@ -30,7 +30,7 @@ import (
 	"time"
 )
 
-const version = "0.3.1"
+const version = "0.3.2"
 
 // cacheSchema changes whenever the cache file layout changes.
 const cacheSchema = 1

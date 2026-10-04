@@ -516,3 +516,150 @@ func TestConfigAdoptsNewDirectEnvPresence(t *testing.T) {
 		})
 	}
 }
+
+func TestConfigRecoversLateStaleWriteAfterUnwrap(t *testing.T) {
+	for _, client := range []string{"claude", "cursor", "codex", "grok"} {
+		t.Run(client, func(t *testing.T) {
+			dir := t.TempDir()
+			path, state := filepath.Join(dir, "config"), filepath.Join(dir, "state")
+			initial := `{"mcpServers":{"sample":{"command":"node","args":["server.mjs"],"env":{"TOKEN":"keep"},"cwd":"/project"},"other":{"command":"other"}},"counter":1}`
+			if client == "codex" || client == "grok" {
+				initial = "counter = 1\n[mcp_servers.sample]\ncommand = 'node'\nargs = ['server.mjs']\ncwd = '/project'\nenv = {TOKEN = 'keep'}\n[mcp_servers.other]\ncommand = 'other'\n"
+			}
+			os.WriteFile(path, []byte(initial), 0600)
+			configMust(t, "wrap", client, path, state, "--env", "MCP_LAZY_IDLE_STOP=0")
+			stale, _ := os.ReadFile(path)
+			configMust(t, "unwrap", client, path, state)
+			statePath := filepath.Join(state, digest(client+"\n"+path+"\nsample")+".json")
+			if _, err := os.Stat(statePath); !os.IsNotExist(err) {
+				t.Fatal("successful unwrap should remove metadata")
+			}
+			// An external writer read before unwrap, then replaced the file after it.
+			os.WriteFile(path, stale, 0600)
+			status := configMust(t, "status", client, path, state)
+			var report map[string]any
+			json.Unmarshal(status, &report)
+			if report["wrapped"] != true || report["managed"] != false || report["recoverable"] != true {
+				t.Fatalf("orphan hidden: %s", status)
+			}
+			for _, action := range []string{"wrap", "reapply", "unwrap"} {
+				if _, err := configRun(t, action, client, path, state); err == nil {
+					t.Fatalf("%s accepted without explicit recovery", action)
+				}
+			}
+			before, _ := os.ReadFile(path)
+			configMust(t, "unwrap", client, path, state, "--recover", "--dry-run")
+			after, _ := os.ReadFile(path)
+			if !bytes.Equal(before, after) {
+				t.Fatal("recovery dry-run changed config")
+			}
+			if _, err := os.Stat(statePath); !os.IsNotExist(err) {
+				t.Fatal("recovery dry-run created metadata")
+			}
+			model := configRead(t, path, client)
+			entry, _ := serverEntry(model, client, "sample")
+			entry["command"], entry["args"] = "node", []any{"server.mjs"}
+			out := configMust(t, "unwrap", client, path, state, "--recover")
+			if !bytes.Contains(out, []byte(`"environmentPreserved":true`)) || !bytes.Contains(out, []byte(`"recovered":true`)) {
+				t.Fatalf("recovery limits not reported: %s", out)
+			}
+			if got := configRead(t, path, client); !reflect.DeepEqual(got, model) {
+				t.Fatalf("recovery lost unrelated settings: %v", got)
+			}
+			info, _ := os.Stat(path)
+			if info.Mode().Perm() != 0600 {
+				t.Fatal("recovery changed permissions")
+			}
+			status = configMust(t, "status", client, path, state)
+			json.Unmarshal(status, &report)
+			if report["wrapped"] != false || report["managed"] != false {
+				t.Fatalf("not recovered: %s", status)
+			}
+			configMust(t, "wrap", client, path, state)
+			configMust(t, "unwrap", client, path, state)
+		})
+	}
+}
+
+func TestConfigUnmanagedRelayRecoveryRecognitionAndRefusal(t *testing.T) {
+	for _, command := range []string{"/old/mcp-lazy-0.3.1-0dc54fb", "/old/MCP-LAZY.exe", relayBinary} {
+		dir := t.TempDir()
+		path, state := filepath.Join(dir, "config"), filepath.Join(dir, "state")
+		data, _ := json.Marshal(map[string]any{"mcpServers": map[string]any{"sample": map[string]any{"command": command, "args": []string{"node"}}}})
+		os.WriteFile(path, data, 0600)
+		configMust(t, "unwrap", "cursor", path, state, "--recover")
+		entry, _ := serverEntry(configRead(t, path, "cursor"), "cursor", "sample")
+		if entry["command"] != "node" || !reflect.DeepEqual(entry["args"], []any{}) {
+			t.Fatalf("empty args must remain explicit: %v", entry)
+		}
+	}
+	for _, tc := range []struct {
+		command string
+		args    []string
+	}{
+		{"mcp-lazy", nil}, {"mcp-lazy", []string{""}}, {"mcp-lazy", []string{"--idle-stop=0", "node"}},
+		{"mcp-lazy", []string{"--", "node"}}, {"mcp-lazy", []string{"mcp-lazy-older", "node"}},
+		{"other-wrapper", []string{"node"}},
+	} {
+		dir := t.TempDir()
+		path, state := filepath.Join(dir, "config"), filepath.Join(dir, "state")
+		data, _ := json.Marshal(map[string]any{"mcpServers": map[string]any{"sample": map[string]any{"command": tc.command, "args": tc.args}}})
+		if tc.args == nil {
+			data = []byte(`{"mcpServers":{"sample":{"command":"mcp-lazy","args":[]}}}`)
+		}
+		os.WriteFile(path, data, 0600)
+		if _, err := configRun(t, "unwrap", "claude", path, state, "--recover"); err == nil {
+			t.Fatalf("accepted unsafe shape: %v", tc)
+		}
+		got, _ := os.ReadFile(path)
+		if !bytes.Equal(data, got) {
+			t.Fatal("refused recovery changed configuration")
+		}
+		out := configMust(t, "status", "claude", path, state)
+		var status map[string]any
+		json.Unmarshal(out, &status)
+		if status["recoverable"] != false || status["managed"] != false {
+			t.Fatalf("bad refusal status: %s", out)
+		}
+	}
+}
+
+func TestConfigRecoverOnlyAppliesToUnwrapAndUsesExistingMetadata(t *testing.T) {
+	dir := t.TempDir()
+	path, state := filepath.Join(dir, "config"), filepath.Join(dir, "state")
+	initial := []byte(`{"mcpServers":{"sample":{"command":"node","env":{"MCP_LAZY_IDLE_STOP":"30s"}}}}`)
+	os.WriteFile(path, initial, 0600)
+	for _, action := range []string{"wrap", "reapply", "status"} {
+		if _, err := configRun(t, action, "claude", path, state, "--recover"); err == nil {
+			t.Fatalf("accepted recover for %s", action)
+		}
+	}
+	configMust(t, "wrap", "claude", path, state, "--env", "MCP_LAZY_IDLE_STOP=0")
+	configMust(t, "unwrap", "claude", path, state, "--recover")
+	entry, _ := serverEntry(configRead(t, path, "claude"), "claude", "sample")
+	if entry["args"] != nil || entry["env"].(map[string]any)["MCP_LAZY_IDLE_STOP"] != "30s" {
+		t.Fatal("recovery flag ignored valid original metadata")
+	}
+}
+
+func TestConfigRecoveryRejectsLateConflictWithoutCreatingState(t *testing.T) {
+	dir := t.TempDir()
+	path, stateDir := filepath.Join(dir, "config"), filepath.Join(dir, "state")
+	os.WriteFile(path, []byte(`{"mcpServers":{"sample":{"command":"/old/mcp-lazy","args":["node","server.mjs"],"env":{"TOKEN":"keep"}}}}`), 0600)
+	external := []byte(`{"mcpServers":{"sample":{"command":"external"}},"counter":2}`)
+	requested := registration{Schema: 1, Client: "cursor", Config: path, Server: "sample", Relay: relayBinary, Managed: envFlags{}, BaseEnv: map[string]*string{}, Recover: true}
+	err := manageRegistrationWithWrite("unwrap", requested, stateDir, false, func(path string, next []byte, mode os.FileMode, check func() error) error {
+		return atomicWriteChecked(path, next, mode, func() error { os.WriteFile(path, external, 0600); return check() })
+	})
+	if err == nil || !strings.Contains(err.Error(), "configuration changed") {
+		t.Fatalf("late conflict accepted: %v", err)
+	}
+	got, _ := os.ReadFile(path)
+	if !bytes.Equal(got, external) {
+		t.Fatal("recovery overwrote external settings")
+	}
+	statePath := filepath.Join(stateDir, digest("cursor\n"+path+"\nsample")+".json")
+	if _, err := os.Stat(statePath); !os.IsNotExist(err) {
+		t.Fatal("failed recovery created metadata")
+	}
+}
