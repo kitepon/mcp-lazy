@@ -14,6 +14,7 @@ package main
 import (
 	"bufio"
 	"bytes"
+	"context"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
@@ -26,11 +27,10 @@ import (
 	"path/filepath"
 	"reflect"
 	"sync"
-	"syscall"
 	"time"
 )
 
-const version = "0.2.0"
+const version = "0.3.0"
 
 // cacheSchema changes whenever the cache file layout changes.
 const cacheSchema = 1
@@ -77,6 +77,12 @@ type relay struct {
 	startTick    <-chan time.Time
 	discardChild bool
 	log          func(string, ...any)
+	wakeArgv     []string
+	wakeInterval time.Duration
+	wakeTimeout  time.Duration
+	wakeResults  chan wakeResult
+	probeRunning bool
+	probeCancel  context.CancelFunc
 
 	out   *bufio.Writer
 	outMu sync.Mutex
@@ -113,6 +119,9 @@ type relay struct {
 }
 
 func main() {
+	if len(os.Args) > 1 && os.Args[1] == "config" {
+		os.Exit(configCommand(os.Args[2:]))
+	}
 	fs := flag.NewFlagSet("mcp-lazy", flag.ContinueOnError)
 	fs.Usage = func() {
 		fmt.Fprintf(os.Stderr, "usage: mcp-lazy [flags] -- <command> [args...]\n\nflags:\n")
@@ -125,6 +134,9 @@ func main() {
 	showVersion := fs.Bool("version", false, "print the version and exit")
 	verbose := fs.Bool("verbose", false, "log what mcp-lazy does to stderr")
 	logFile := fs.String("log-file", "", "append what mcp-lazy does to this file")
+	wakeCommand := fs.String("wake-command", "", "JSON argv of a predicate: exit 0 wakes, 1 sleeps, other exits are errors")
+	wakeInterval := fs.Duration("wake-interval", 5*time.Second, "interval between wake predicate checks")
+	wakeTimeout := fs.Duration("wake-timeout", time.Second, "maximum duration of one wake predicate")
 	if err := fs.Parse(os.Args[1:]); err != nil {
 		os.Exit(2)
 	}
@@ -138,7 +150,8 @@ func main() {
 	for name, variable := range map[string]string{
 		"cache-dir": "MCP_LAZY_CACHE_DIR", "idle-stop": "MCP_LAZY_IDLE_STOP",
 		"start-timeout": "MCP_LAZY_START_TIMEOUT", "log-file": "MCP_LAZY_LOG_FILE",
-		"verbose": "MCP_LAZY_VERBOSE",
+		"verbose":      "MCP_LAZY_VERBOSE",
+		"wake-command": "MCP_LAZY_WAKE_COMMAND", "wake-interval": "MCP_LAZY_WAKE_INTERVAL", "wake-timeout": "MCP_LAZY_WAKE_TIMEOUT",
 	} {
 		if value, ok := os.LookupEnv(variable); ok && !explicit[name] {
 			if err := fs.Set(name, value); err != nil {
@@ -147,9 +160,26 @@ func main() {
 			}
 		}
 	}
-	if *startTimeout <= 0 || *idleStop < 0 {
-		fmt.Fprintln(os.Stderr, "mcp-lazy: start-timeout must be positive and idle-stop must not be negative")
+	if *startTimeout <= 0 || *idleStop < 0 || *wakeInterval <= 0 || *wakeTimeout <= 0 {
+		fmt.Fprintln(os.Stderr, "mcp-lazy: start-timeout/wake-interval/wake-timeout must be positive and idle-stop must not be negative")
 		os.Exit(2)
+	}
+	var wakeArgv []string
+	if *wakeCommand != "" {
+		var arguments []json.RawMessage
+		valid := json.Unmarshal([]byte(*wakeCommand), &arguments) == nil && len(arguments) > 0
+		for _, argument := range arguments {
+			var value string
+			if len(argument) == 0 || argument[0] != '"' || json.Unmarshal(argument, &value) != nil {
+				valid = false
+				break
+			}
+			wakeArgv = append(wakeArgv, value)
+		}
+		if !valid || len(wakeArgv) == 0 || wakeArgv[0] == "" {
+			fmt.Fprintln(os.Stderr, "mcp-lazy: wake-command must be a JSON array of strings with a nonempty command")
+			os.Exit(2)
+		}
 	}
 	command := fs.Args()
 	if len(command) == 0 {
@@ -165,10 +195,11 @@ func main() {
 		dir = filepath.Join(base, "mcp-lazy")
 	}
 	r := &relay{
-		command:        command,
-		cachePath:      filepath.Join(dir, cacheKey(command)+".json"),
-		idleStop:       *idleStop,
-		startTimeout:   *startTimeout,
+		command:      command,
+		cachePath:    filepath.Join(dir, cacheKey(command)+".json"),
+		idleStop:     *idleStop,
+		startTimeout: *startTimeout,
+		wakeArgv:     wakeArgv, wakeInterval: *wakeInterval, wakeTimeout: *wakeTimeout,
 		out:            bufio.NewWriter(os.Stdout),
 		inflight:       map[string]string{},
 		early:          map[string]bool{},
@@ -319,9 +350,17 @@ func (r *relay) run(stdin io.Reader) int {
 		close(clientDone)
 	}()
 	signals := make(chan os.Signal, 1)
-	signal.Notify(signals, syscall.SIGTERM, syscall.SIGINT)
+	signal.Notify(signals, shutdownSignals()...)
 	defer signal.Stop(signals)
 	defer r.endStartup()
+	var wakeTick <-chan time.Time
+	if len(r.wakeArgv) > 0 {
+		ticker := time.NewTicker(r.wakeInterval)
+		defer ticker.Stop()
+		wakeTick = ticker.C
+		r.wakeResults = make(chan wakeResult, 1)
+		defer r.stopWakeProbe()
+	}
 
 	var idle <-chan time.Time
 	var idleTimer *time.Timer
@@ -357,6 +396,23 @@ func (r *relay) run(stdin io.Reader) int {
 			r.failInflight("mcp-lazy: the server exited or stopped accepting input")
 			r.discardChild = true
 			r.stopChild()
+		case <-wakeTick:
+			r.launchWakeProbe()
+		case result := <-r.wakeResults:
+			r.probeRunning = false
+			if r.probeCancel != nil {
+				r.probeCancel()
+				r.probeCancel = nil
+			}
+			if result.err != nil {
+				r.log("wake predicate failed: %v", result.err)
+			}
+			if result.wake && !r.running && r.initialized && len(r.initParams) > 0 {
+				r.log("wake predicate matched; starting the server")
+				if err := r.startChild(true); err != nil {
+					r.log("wake startup failed: %v", err)
+				}
+			}
 		case <-r.startTick:
 			r.log("startup exceeded %s", r.startTimeout)
 			r.failInflight("mcp-lazy: server startup timed out after " + r.startTimeout.String())
@@ -491,6 +547,7 @@ func (r *relay) fromClient(line []byte) {
 		if r.running && !r.starting {
 			r.writeChild(line)
 		}
+		r.launchWakeProbe()
 	case !r.running && m.Method == "ping" && m.hasID():
 		r.reply(m.ID, json.RawMessage(`{}`))
 	case !r.running && listMethods[m.Method] && m.hasID() && plainListing(m.Params) && r.cachedList(m.Method) != nil:
@@ -499,7 +556,14 @@ func (r *relay) fromClient(line []byte) {
 		// A notification with no server to hear it (cancelled, roots changed, ...).
 	case r.proto == "" && m.hasID():
 		// Asked ahead of initialize: newer clients try server/discover first.
-		if answer := r.cache.Before[earlyKey(&m)]; len(answer) > 0 && !r.running {
+		answer := r.cache.Before[earlyKey(&m)]
+		if len(answer) == 0 && m.Method == "server/discover" {
+			candidate := r.cache.Before[unsupportedDiscoveryKey(&m)]
+			if isMethodNotFound(candidate) {
+				answer = candidate
+			}
+		}
+		if len(answer) > 0 && !r.running {
 			r.log("%s answered from the cache", m.Method)
 			r.toClient([]byte(`{"jsonrpc":"2.0","id":` + string(m.ID) + `,` + string(answer[1:])))
 			return
@@ -516,6 +580,40 @@ func (r *relay) fromClient(line []byte) {
 func earlyKey(m *message) string {
 	sum := sha256.Sum256(m.Params)
 	return m.Method + ":" + hex.EncodeToString(sum[:8])
+}
+
+// Only a Method-not-found result is reusable across client version changes.
+// Capabilities, client identity, protocol and every other parameter stay scoped.
+func unsupportedDiscoveryKey(m *message) string {
+	if m.Method != "server/discover" {
+		return ""
+	}
+	var fields map[string]any
+	decoder := json.NewDecoder(bytes.NewReader(m.Params))
+	decoder.UseNumber()
+	if decoder.Decode(&fields) != nil || fields == nil {
+		return ""
+	}
+	if client, ok := fields["clientInfo"].(map[string]any); ok {
+		delete(client, "version")
+	}
+	if meta, ok := fields["_meta"].(map[string]any); ok {
+		if client, ok := meta["io.modelcontextprotocol/clientInfo"].(map[string]any); ok {
+			delete(client, "version")
+		}
+	}
+	canonical, _ := json.Marshal(fields)
+	sum := sha256.Sum256(canonical)
+	return "server/discover:unsupported:" + hex.EncodeToString(sum[:16])
+}
+
+func isMethodNotFound(answer json.RawMessage) bool {
+	var result struct {
+		Error *struct {
+			Code int `json:"code"`
+		} `json:"error"`
+	}
+	return json.Unmarshal(answer, &result) == nil && result.Error != nil && result.Error.Code == -32601
 }
 
 func (r *relay) cachedList(method string) json.RawMessage {
@@ -722,6 +820,14 @@ func (r *relay) learnEarly(line []byte, m *message) {
 	key := earlyKey(&request)
 	if !sameJSON(r.cache.Before[key], answer) {
 		r.cache.Before[key] = answer
+		r.saveCache()
+	}
+	if stable := unsupportedDiscoveryKey(&request); stable != "" {
+		if isMethodNotFound(answer) {
+			r.cache.Before[stable] = answer
+		} else {
+			delete(r.cache.Before, stable)
+		}
 		r.saveCache()
 	}
 }

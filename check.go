@@ -5,7 +5,6 @@ import (
 	"fmt"
 	"os"
 	"os/signal"
-	"syscall"
 	"time"
 )
 
@@ -27,23 +26,27 @@ func (r *relay) runCheck() error {
 	if json.Unmarshal(params, &init) != nil || init.ProtocolVersion == "" || init.Capabilities == nil || init.ClientInfo.Name == "" || init.ClientInfo.Version == "" {
 		return fmt.Errorf("MCP_LAZY_CHECK_INITIALIZE must contain protocolVersion, capabilities and clientInfo name/version")
 	}
+	beforeRequests, err := checkBeforeRequests(params)
+	if err != nil {
+		return err
+	}
+	before := map[string]json.RawMessage{}
+	clearBefore := map[string]bool{}
 	deadline := time.NewTimer(r.startTimeout)
 	defer deadline.Stop()
 	signals := make(chan os.Signal, 1)
-	signal.Notify(signals, syscall.SIGTERM, syscall.SIGINT)
+	signal.Notify(signals, shutdownSignals()...)
 	defer signal.Stop(signals)
 	if err := r.startChild(false); err != nil {
 		return err
 	}
 	defer r.stopChild()
 	request := 0
-	query := func(method string, arguments json.RawMessage) (json.RawMessage, error) {
+	query := func(method string, arguments json.RawMessage, allowProtocolError bool) (json.RawMessage, error) {
 		request++
 		id := fmt.Sprintf("mcp-lazy-inspect-%d", request)
-		payload, err := json.Marshal(map[string]any{"jsonrpc": "2.0", "id": id, "method": method, "params": arguments})
-		if err != nil {
-			return nil, err
-		}
+		quotedMethod, _ := json.Marshal(method)
+		payload := []byte(`{"jsonrpc":"2.0","id":"` + id + `","method":` + string(quotedMethod) + `,"params":` + string(arguments) + `}`)
 		r.writeChild(payload)
 		for {
 			select {
@@ -63,11 +66,17 @@ func (r *relay) runCheck() error {
 					continue
 				}
 				if len(m.Error) > 0 {
+					if allowProtocolError {
+						return json.RawMessage(`{"error":` + string(m.Error) + `}`), nil
+					}
 					return nil, fmt.Errorf("%s: server returned an error: %s", method, m.Error)
 				}
 				var result map[string]json.RawMessage
 				if json.Unmarshal(m.Result, &result) != nil || result == nil {
 					return nil, fmt.Errorf("%s: expected an object result", method)
+				}
+				if allowProtocolError {
+					return json.RawMessage(`{"result":` + string(m.Result) + `}`), nil
 				}
 				return m.Result, nil
 			case err := <-r.childDone:
@@ -82,7 +91,29 @@ func (r *relay) runCheck() error {
 			}
 		}
 	}
-	result, err := query("initialize", params)
+	for _, request := range beforeRequests {
+		answer, err := query(request.Method, request.Params, true)
+		if err != nil {
+			return err
+		}
+		// Only a genuine Method-not-found error is useful for a legacy fallback.
+		if len(answer) > 0 && answer[0] == '{' && !isMethodNotFound(answer) {
+			var fields map[string]json.RawMessage
+			json.Unmarshal(answer, &fields)
+			if fields["error"] != nil {
+				return fmt.Errorf("%s: pre-initialization probe failed: %s", request.Method, fields["error"])
+			}
+		}
+		before[earlyKey(&request)] = answer
+		if stable := unsupportedDiscoveryKey(&request); stable != "" {
+			if isMethodNotFound(answer) {
+				before[stable] = answer
+			} else {
+				clearBefore[stable] = true
+			}
+		}
+	}
+	result, err := query("initialize", params, false)
 	if err != nil {
 		return err
 	}
@@ -119,7 +150,7 @@ func (r *relay) runCheck() error {
 		arguments := json.RawMessage(`{}`)
 		seen := map[string]bool{}
 		for {
-			page, err := query(descriptor.method, arguments)
+			page, err := query(descriptor.method, arguments, false)
 			if err != nil {
 				return err
 			}
@@ -155,8 +186,38 @@ func (r *relay) runCheck() error {
 	// Reap before reporting success. The deferred call is then a no-op.
 	r.stopChild()
 	r.cache.Entries[init.ProtocolVersion] = entry
+	for key := range clearBefore {
+		delete(r.cache.Before, key)
+	}
+	for key, answer := range before {
+		r.cache.Before[key] = answer
+	}
 	if err := r.saveCache(); err != nil {
 		return fmt.Errorf("saving cache: %w", err)
 	}
-	return json.NewEncoder(os.Stdout).Encode(map[string]any{"ok": true, "version": version, "protocolVersion": init.ProtocolVersion, "cachePath": r.cachePath, "lists": lists})
+	return json.NewEncoder(os.Stdout).Encode(map[string]any{"ok": true, "version": version, "protocolVersion": init.ProtocolVersion, "cachePath": r.cachePath, "lists": lists, "beforeRequests": len(beforeRequests)})
+}
+
+func checkBeforeRequests(initialize json.RawMessage) ([]message, error) {
+	if text, ok := os.LookupEnv("MCP_LAZY_CHECK_BEFORE"); ok {
+		var requests []message
+		if json.Unmarshal([]byte(text), &requests) != nil || requests == nil {
+			return nil, fmt.Errorf("MCP_LAZY_CHECK_BEFORE must be an array of method/params objects (or [] to disable)")
+		}
+		for _, request := range requests {
+			if request.Method != "server/discover" {
+				return nil, fmt.Errorf("check-before only supports the read-only server/discover probe")
+			}
+			var fields map[string]json.RawMessage
+			if json.Unmarshal(request.Params, &fields) != nil || fields == nil {
+				return nil, fmt.Errorf("check-before params must be an object")
+			}
+		}
+		return requests, nil
+	}
+	var fields map[string]json.RawMessage
+	json.Unmarshal(initialize, &fields)
+	// Preserve the raw clientInfo and capabilities field order used by the CLI.
+	params := json.RawMessage(`{"_meta":{"io.modelcontextprotocol/protocolVersion":"2026-07-28","io.modelcontextprotocol/clientInfo":` + string(fields["clientInfo"]) + `,"io.modelcontextprotocol/clientCapabilities":` + string(fields["capabilities"]) + `}}`)
+	return []message{{Method: "server/discover", Params: params}}, nil
 }

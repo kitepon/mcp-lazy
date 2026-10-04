@@ -2,7 +2,12 @@
 
 package main
 
-import "os/exec"
+import (
+	"os"
+	"os/exec"
+)
+
+func shutdownSignals() []os.Signal { return []os.Signal{os.Interrupt} }
 
 // Group cleanup is supported on Linux and macOS only. Other platforms are untested.
 func configureProcess(cmd *exec.Cmd) {}

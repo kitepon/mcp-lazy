@@ -3,9 +3,14 @@
 package main
 
 import (
+	"os"
 	"os/exec"
 	"syscall"
 )
+
+func shutdownSignals() []os.Signal {
+	return []os.Signal{syscall.SIGTERM, syscall.SIGINT, syscall.SIGHUP}
+}
 
 func configureProcess(cmd *exec.Cmd) {
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}

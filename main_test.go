@@ -20,6 +20,10 @@ import (
 var relayBinary string
 
 func TestMain(m *testing.M) {
+	if len(os.Args) > 1 && os.Args[1] == "wake-probe" {
+		fakeWakeProbe()
+		return
+	}
 	if os.Getenv("MCP_LAZY_FAKE_GRANDCHILD") == "1" {
 		signal.Ignore(syscall.SIGTERM)
 		os.WriteFile(os.Getenv("FAKE_GRANDCHILD_PID"), []byte(strconv.Itoa(os.Getpid())), 0o600)
@@ -121,6 +125,14 @@ func fakeServer() {
 					}
 				}
 				note("discover")
+				if os.Getenv("FAKE_DISCOVER_SUCCESS") == "1" {
+					send(`{"jsonrpc":"2.0","id":` + string(m.ID) + `,"result":{"probe":` + string(m.Params) + `}}`)
+					continue
+				}
+				if os.Getenv("FAKE_DISCOVER_ERROR") == "1" {
+					send(`{"jsonrpc":"2.0","id":` + string(m.ID) + `,"error":{"code":-32000,"message":"unavailable"}}`)
+					continue
+				}
 				send(`{"jsonrpc":"2.0","id":` + string(m.ID) + `,"error":{"code":-32601,"message":"Method not found"}}`)
 			case "notifications/initialized":
 				note("initialized")
