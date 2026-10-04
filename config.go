@@ -39,6 +39,7 @@ type registration struct {
 	Command    string             `json:"command"`
 	Args       []string           `json:"args"`
 	HadArgs    bool               `json:"hadArgs"`
+	HadEnv     *bool              `json:"hadEnv,omitempty"`
 	Managed    envFlags           `json:"managedEnv"`
 	BaseEnv    map[string]*string `json:"baseEnv"`
 }
@@ -197,6 +198,10 @@ func entryEnv(entry map[string]any) (map[string]any, error) {
 }
 
 func manageRegistration(action string, requested registration, stateDir string, dryRun bool) error {
+	return manageRegistrationWithWrite(action, requested, stateDir, dryRun, atomicWriteChecked)
+}
+
+func manageRegistrationWithWrite(action string, requested registration, stateDir string, dryRun bool, write func(string, []byte, os.FileMode, func() error) error) error {
 	key := digest(requested.Client + "\n" + requested.Config + "\n" + requested.Server)
 	statePath := filepath.Join(stateDir, key+".json")
 	if !dryRun && action != "status" {
@@ -257,8 +262,12 @@ func manageRegistration(action string, requested registration, stateDir string, 
 		return fmt.Errorf("registration points at an unmanaged relay; refusing to nest wrappers")
 	}
 	reg := requested
+	previousManaged := envFlags{}
 	if exists {
 		reg = stored
+		for name, value := range stored.Managed {
+			previousManaged[name] = value
+		}
 		if reg.Relay != requested.Relay {
 			reg.PriorRelay = reg.Relay
 		}
@@ -293,7 +302,28 @@ func manageRegistration(action string, requested registration, stateDir string, 
 			reg.Args = append([]string{}, args[1:]...)
 		} else {
 			reg.Command, reg.Args, reg.HadArgs = command, args, hadArgs
+			if !exists {
+				hadEnv := entry["env"] != nil
+				reg.HadEnv = &hadEnv
+			} else {
+				// Adopt an unambiguous env shape from a newer direct registration.
+				// An object containing only our retained overrides is ambiguous.
+				hadEnv := entry["env"] != nil
+				known := !hadEnv || len(env) == 0
+				for name, value := range env {
+					if managed, ok := previousManaged[name]; !ok || value != managed {
+						known = true
+					}
+				}
+				if known {
+					reg.HadEnv = &hadEnv
+				}
+			}
 			for name := range reg.Managed {
+				if old, ok := env[name]; ok && exists && old == previousManaged[name] {
+					// setup may retain our overrides when restoring a direct command.
+					continue
+				}
 				if old, ok := env[name]; ok {
 					value := old.(string)
 					reg.BaseEnv[name] = &value
@@ -316,6 +346,24 @@ func manageRegistration(action string, requested registration, stateDir string, 
 		changes["args"] = stringsToAny(append([]string{reg.Command}, reg.Args...))
 		for name, value := range reg.Managed {
 			changes["env."+name] = value
+		}
+	}
+	if action == "unwrap" && reg.HadEnv != nil && !*reg.HadEnv {
+		remaining := len(env)
+		for field, value := range changes {
+			if strings.HasPrefix(field, "env.") && value == nil {
+				if _, ok := env[strings.TrimPrefix(field, "env.")]; ok {
+					remaining--
+				}
+			}
+		}
+		if remaining == 0 && entry["env"] != nil {
+			for field := range changes {
+				if strings.HasPrefix(field, "env.") {
+					delete(changes, field)
+				}
+			}
+			changes["env"] = nil
 		}
 	}
 	changed := []string{}
@@ -382,11 +430,21 @@ func manageRegistration(action string, requested registration, stateDir string, 
 			}
 			return fmt.Errorf("configuration changed during editing; no configuration was overwritten; rerun after setup/register finishes")
 		}
-		if err := atomicWrite(requested.Config, next, info.Mode().Perm()); err != nil {
+		if err := write(requested.Config, next, info.Mode().Perm(), func() error {
+			latest, err := os.Stat(requested.Config)
+			if err != nil || !os.SameFile(info, latest) || latest.Mode() != info.Mode() {
+				return fmt.Errorf("configuration changed during editing")
+			}
+			current, err := os.ReadFile(requested.Config)
+			if err != nil || !bytes.Equal(current, data) {
+				return fmt.Errorf("configuration changed during editing")
+			}
+			return nil
+		}); err != nil {
 			if err := rollbackState(); err != nil {
 				return fmt.Errorf("writing configuration and restoring registration state failed; backup is retained")
 			}
-			return fmt.Errorf("writing configuration failed; backup is retained")
+			return fmt.Errorf("writing configuration failed: %w; backup is retained", err)
 		}
 	}
 	if action == "unwrap" {
@@ -406,6 +464,12 @@ func stringsToAny(items []string) []any {
 }
 
 func atomicWrite(path string, data []byte, mode os.FileMode) error {
+	return atomicWriteChecked(path, data, mode, nil)
+}
+
+// The check runs after the temporary file is synced, immediately before rename.
+// Uncooperative writers still require an offline editing window.
+func atomicWriteChecked(path string, data []byte, mode os.FileMode, check func() error) error {
 	file, err := os.CreateTemp(filepath.Dir(path), ".mcp-lazy-*")
 	if err != nil {
 		return err
@@ -426,6 +490,11 @@ func atomicWrite(path string, data []byte, mode os.FileMode) error {
 	if err := file.Close(); err != nil {
 		return err
 	}
+	if check != nil {
+		if err := check(); err != nil {
+			return err
+		}
+	}
 	return os.Rename(file.Name(), path)
 }
 
@@ -439,6 +508,17 @@ func patchConfiguration(data []byte, model map[string]any, client, server string
 	if err != nil {
 		return nil, err
 	}
+	effective := map[string]any{}
+	for field, value := range changes {
+		old := entry[field]
+		if strings.HasPrefix(field, "env.") {
+			old = env[strings.TrimPrefix(field, "env.")]
+		}
+		if !reflect.DeepEqual(old, value) {
+			effective[field] = value
+		}
+	}
+	changes = effective
 	for field, value := range changes {
 		if strings.HasPrefix(field, "env.") {
 			key := strings.TrimPrefix(field, "env.")
@@ -456,8 +536,7 @@ func patchConfiguration(data []byte, model map[string]any, client, server string
 	}
 	var next []byte
 	if client == "claude" || client == "cursor" {
-		next, err = json.MarshalIndent(model, "", "  ")
-		next = append(next, '\n')
+		next, err = patchJSON(data, server, changes)
 	} else {
 		patchChanges := changes
 		if !hadEnv && len(env) > 0 {

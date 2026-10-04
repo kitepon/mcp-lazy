@@ -48,12 +48,25 @@ func patchToml(data []byte, server string, changes map[string]any) ([]byte, erro
 			continue
 		}
 		var key []string
+		keyEnd := 0
 		it := node.Key()
 		for it.Next() {
 			key = append(key, string(it.Node().Data))
+			keyEnd = int(it.Node().Raw.Offset + it.Node().Raw.Length)
 		}
 		if node.Kind == unstable.Table || node.Kind == unstable.ArrayTable {
 			section = key
+			if value, removing := changes["env"]; removing && value == nil && reflect.DeepEqual(section, append(append([]string{}, base...), "env")) {
+				// Table nodes have no Raw span; the key nodes locate the header.
+				start := bytes.LastIndexByte(data[:int(node.Child().Raw.Offset)+1], '[')
+				end := keyEnd + bytes.IndexByte(data[keyEnd:], ']') + 1
+				if start < 0 || end <= keyEnd {
+					return nil, fmt.Errorf("unsupported TOML env table header")
+				}
+				edits = append(edits, configEdit{start, end, ""})
+				done["env"] = true
+				continue
+			}
 			if node.Kind == unstable.Table {
 				first := node.Child()
 				start := int(first.Raw.Offset)
@@ -67,6 +80,14 @@ func patchToml(data []byte, server string, changes map[string]any) ([]byte, erro
 			continue
 		}
 		path := append(append([]string{}, section...), key...)
+		if value, removing := changes["env"]; removing && value == nil {
+			envPath := append(append([]string{}, base...), "env")
+			if len(path) >= len(envPath) && reflect.DeepEqual(path[:len(envPath)], envPath) {
+				edits = append(edits, configEdit{int(node.Raw.Offset), int(node.Raw.Offset + node.Raw.Length), ""})
+				done["env"] = true
+				continue
+			}
+		}
 		// env may be an inline table. Merge it through the decoded map, while
 		// keeping the rest of the document unchanged.
 		if reflect.DeepEqual(path, append(append([]string{}, base...), "env")) {

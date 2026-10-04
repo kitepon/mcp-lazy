@@ -4,7 +4,7 @@ A small stdio MCP relay that starts the real server when it is needed. Recorded
 initialization and listings let unused servers stay asleep. Once started, the
 server stays alive by default, preserving its in-memory session state.
 
-Version 0.3.0 is a Linux trial build. Real-client acceptance for this version is
+Version 0.3.1 is a Linux trial build. Real-client acceptance for this version is
 pending. A license has not been selected yet.
 
 Source: https://github.com/kitepon/mcp-lazy
@@ -176,6 +176,29 @@ does not recover work before the client connects. The predicate must be safe to
 run repeatedly. Product-specific delivery ownership and recovery remain the
 predicate's responsibility; a matching condition alone does not prove delivery.
 
+## Aiterm process-count contract
+
+For Aiterm integration, the basename of the first argument in the relay's launch
+argv must start with `mcp-lazy`, ignoring case. Use that name in the MCP
+registration's `command` path, for example `mcp-lazy`, `mcp-lazy-0.3.0-7cdb9cc`
+or `mcp-lazy.exe`. Aiterm identifies the relay from the first word of `ps`'s
+command output; it does not inspect the filename on disk. An alias symlink with
+a different name or an intervening wrapper can prevent recognition.
+
+The real server and the wake-predicate process start as direct children of the
+relay. This argv naming rule and parent-child relationship are a compatibility
+contract: changes require prior coordination with Aiterm. Aiterm excludes only
+these direct children from the process count used to decide whether a seat can
+close. Grandchildren and further descendants are counted normally, including
+children started by a wake predicate. The relay itself retains Aiterm's usual
+treatment of processes present in the CLI's startup baseline.
+
+The contract describes the agreed Aiterm integration; confirm that the installed
+Aiterm version implements it. It does not guarantee delivery after a seat closes.
+Since 0.3.0, SIGHUP also stops the server's process group. A surviving, initialized
+relay can run a wake predicate; when all relays are gone, an external recovery
+mechanism is required. Delivery acceptance must cover both conditions.
+
 ## Wrap, reapply and restore a registration
 
 Use an explicit client file, server name and persistent state directory. The
@@ -211,14 +234,25 @@ wrapping it. Other client settings, including `env_vars`, timeouts, permissions,
 working directory and unrelated registrations, are kept. Unwrap restores the
 latest direct command and arguments, and restores only environment values that
 still match the managed overrides. Later user changes to those values are kept.
-An empty environment object/table may remain after its managed keys are removed.
+Environment values retained by setup are not adopted as original values when
+they still match the previous managed overrides. A newly wrapped registration
+records whether `env` was present; unwrap removes an empty object/table created
+by the relay and preserves one that was originally empty.
+
+Registration metadata written by 0.3.0 remains readable. It did not record the
+original presence of `env`, so unwrap conservatively keeps an empty object/table
+for that metadata. If 0.3.0 reapply already saved a relay override as its original
+value, recover the original value from its pre-wrap backup before wrapping again;
+the intended original cannot be inferred from the overwritten metadata.
 
 `--dry-run` validates the edited document and reports changed field names without
 writing files or printing values. Changed configuration files are backed up in
 `<state-dir>/backups/`; backups and registration metadata have mode 0600. They may
 contain credentials, so keep the state directory private. The edited config
-keeps its existing permissions. JSON formatting is normalized, with unknown
-settings and large integer values preserved. TOML expressions are parsed with
+keeps its existing permissions. JSON edits replace only changed values and
+insert or remove managed fields. Unedited bytes, key order, whitespace, numeric
+spelling and the presence or absence of a trailing newline are preserved.
+Duplicate keys in objects along an edited path are rejected. TOML expressions are parsed with
 the library; unedited settings and comments remain unchanged. A TOML registration
 must use ordinary or dotted table keys; an enclosing inline-table registration
 is rejected without writing the configuration. Inline `env` tables are supported.
@@ -226,9 +260,16 @@ HTTP registrations and unmanaged nested relays are rejected.
 
 Use one state directory for all relay edits to a configuration file. Relay
 commands serialize those edits on Linux/macOS. External setup/register commands
-do not share that lock: run reapply after they finish, and avoid simultaneous
-external edits. Changes noticed before replacement are rejected and the backup
-is retained. This command does not monitor configuration files or restart an
+do not share that lock. Stop clients and other programs that can write the file
+before applying changes; in particular, close Claude sessions before editing
+`~/.claude.json`. Run reapply after setup/register has finished.
+
+Immediately before replacing the configuration, the command checks that its
+contents, file identity and permissions still match what was read. A detected
+change aborts the write, restores registration metadata and retains the backup.
+This is an optimistic check, not an atomic compare-and-swap with external writers:
+a write between the final check and rename can still be lost. An offline editing
+window is required for safe use. This command does not monitor files or restart an
 already connected CLI. Reconnect the client to use the new registration.
 
 ## Trial limitations
@@ -260,7 +301,9 @@ by subprocess tests. Tests cover cached and cold startup, failed-request retry,
 blocked stdin, all listings and metadata forwarding; checked discovery and CLI
 version changes; SIGHUP cleanup; wake conditions, deadlines and ordinary calls
 during a predicate; and JSON/TOML wrapping, repeated application, setup changes,
-restoration, backups and preservation of unrelated settings.
+restoration, backups, exact preservation of unedited JSON bytes, missing/empty
+environment restoration, setup-retained overrides and late-write conflict
+rejection with registration-state rollback.
 
 With Node.js and the real server executables available, an optional isolated
 protocol smoke test compares discovery, initialization and listings with a
