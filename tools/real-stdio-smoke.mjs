@@ -5,11 +5,9 @@ import { createHash } from 'node:crypto'
 import { mkdirSync, readFileSync, readdirSync, writeFileSync } from 'node:fs'
 import { resolve } from 'node:path'
 import assert from 'node:assert/strict'
+import { smokeProducts } from './stdio-smoke-products.mjs'
 
-const [binaryArg, artifactArg, approvalArg, aitermArg] = process.argv.slice(2)
-if (![binaryArg, artifactArg, approvalArg, aitermArg].every(Boolean)) {
-  throw Error('usage: node real-stdio-smoke.mjs BINARY ARTIFACT_DIR APPROVAL_BOX_CLI AITERM_CLI')
-}
+const { binaryArg, artifactArg, products, serverEnvironment, wakeMarker } = smokeProducts(process.argv.slice(2))
 const binary = resolve(binaryArg)
 const artifacts = resolve(artifactArg)
 mkdirSync(artifacts, { recursive: true })
@@ -94,16 +92,13 @@ async function prepare(args, env, reportPath) {
   return report
 }
 const results = []
-for (const [product, cli, argv] of [
-  ['approval-box', resolve(approvalArg), ['mcp']],
-  ['aiterm', resolve(aitermArg), []],
-]) {
+for (const [product, cli, argv] of products) {
   const dir = artifacts+'/'+product
   mkdirSync(dir+'/home',{recursive:true})
   const env = { ...process.env,
     HOME:dir+'/home', CODEX_HOME:dir+'/home/.codex',
     CLAUDE_CONFIG_DIR:dir+'/home/.claude', CURSOR_HOME:dir+'/home/.cursor', GROK_HOME:dir+'/home/.grok',
-    APPROVAL_BOX_SERVER:'http://127.0.0.1:9', AITERM_STATE_BASE:dir+'/aiterm-state',
+    ...serverEnvironment(dir),
     MCP_LAZY_CACHE_DIR:dir+'/cache', MCP_LAZY_START_TIMEOUT:'5s', MCP_LAZY_IDLE_STOP:'0',
     MCP_LAZY_CHECK_INITIALIZE:JSON.stringify(init),
     MCP_LAZY_CHECK_BEFORE:JSON.stringify([{method:'server/discover',params:discovery}]),
@@ -134,12 +129,12 @@ for (const [product, cli, argv] of [
     assert.deepEqual(await relay.request('smoke/unknown',{}),directUnknown)
     assert.ok(descendants(relay.child.pid).length>0,'ordinary unknown request did not start server')
   } finally { await relay.close() }
-  const wake = connect(binary,args,{...env,MCP_LAZY_WAKE_COMMAND:JSON.stringify(['/usr/bin/test','-d',dir+'/aiterm-state']),MCP_LAZY_WAKE_INTERVAL:'50ms'})
+  const wake = connect(binary,args,{...env,MCP_LAZY_WAKE_COMMAND:JSON.stringify(['/usr/bin/test','-d',wakeMarker(dir)]),MCP_LAZY_WAKE_INTERVAL:'50ms'})
   try {
     await wake.request('initialize',init)
     wake.notify('notifications/initialized')
     // Match a generic condition in an isolated directory; no delivery state is injected.
-    mkdirSync(dir+'/aiterm-state',{recursive:true})
+    mkdirSync(wakeMarker(dir),{recursive:true})
     let awake=false
     for(let n=0;n<100;n++) { if(descendants(wake.child.pid).length>0){awake=true;break}; await sleep(20) }
     assert.ok(awake,'matching predicate did not start real server')
