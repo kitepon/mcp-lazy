@@ -42,6 +42,7 @@ function active(pid) {
 }
 function connect(command, args, env) {
   const child = spawn(command, args, { env, stdio: ['pipe', 'pipe', 'pipe'], cwd: artifacts })
+  for (const stream of [child.stdout, child.stderr]) stream.setEncoding('utf8')
   let buffer = '', stderr = '', nextID = 0
   const pending = new Map()
   const completed = new Promise((resolve, reject) => { child.once('error', reject); child.once('exit', (code, signal) => resolve({ code, signal })) })
@@ -79,6 +80,7 @@ function connect(command, args, env) {
 }
 async function prepare(args, env, reportPath) {
   const child = spawn(binary, ['--check', ...args], { env, cwd: artifacts, stdio: ['ignore','pipe','pipe'] })
+  for (const stream of [child.stdout, child.stderr]) stream.setEncoding('utf8')
   let out = '', stderr = ''
   child.stdout.on('data',chunk => { out += chunk })
   child.stderr.on('data',chunk => { stderr += chunk })
